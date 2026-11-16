@@ -433,11 +433,7 @@ function skipWs(text, j) {
 
 // Parse an inline link destination + optional title starting at text[i] === '('.
 // Returns {end, dest, title} or null.
-function parseInlineDestTitle(text, i) {
-  const n = text.length;
-  let j = skipWs(text, i + 1);
-  if (j >= n) return null;
-  let dest;
+function parseLinkDest(text, j, n) {
   if (text[j] === '<') {
     let k = j + 1;
     let ok = false;
@@ -449,29 +445,27 @@ function parseInlineDestTitle(text, i) {
       k++;
     }
     if (!ok) return null;
-    dest = unescapeStr(text.slice(j + 1, k));
-    j = k + 1;
-  } else {
-    let k = j;
-    let depth = 0;
-    let closed = false;
-    while (k < n) {
-      const c = text[k];
-      if (c === '\\' && k + 1 < n && ASCII_PUNCT.indexOf(text[k + 1]) >= 0) { k += 2; continue; }
-      if (c === '(') { depth++; k++; continue; }
-      if (c === ')') {
-        if (depth === 0) { closed = true; break; }
-        depth--; k++; continue;
-      }
-      if (c === ' ' || c === '\t' || c === '\n' || c.charCodeAt(0) < 32 || c.charCodeAt(0) === 127) break;
-      k++;
-    }
-    if (!closed && k >= n) return null;
-    dest = unescapeStr(text.slice(j, k));
-    j = k;
+    return { dest: unescapeStr(text.slice(j + 1, k)), j: k + 1 };
   }
-  j = skipWs(text, j);
-  if (j >= n) return null;
+  let k = j;
+  let depth = 0;
+  let closed = false;
+  while (k < n) {
+    const c = text[k];
+    if (c === '\\' && k + 1 < n && ASCII_PUNCT.indexOf(text[k + 1]) >= 0) { k += 2; continue; }
+    if (c === '(') { depth++; k++; continue; }
+    if (c === ')') {
+      if (depth === 0) { closed = true; break; }
+      depth--; k++; continue;
+    }
+    if (c === ' ' || c === '\t' || c === '\n' || c.charCodeAt(0) < 32 || c.charCodeAt(0) === 127) break;
+    k++;
+  }
+  if (!closed && k >= n) return null;
+  return { dest: unescapeStr(text.slice(j, k)), j: k };
+}
+
+function parseLinkTitle(text, j, n, dest) {
   let title = null;
   const q = text[j];
   if (q === '"' || q === "'") {
@@ -509,6 +503,17 @@ function parseInlineDestTitle(text, i) {
   }
   if (q === ')') return { end: j + 1, dest, title: null };
   return null;
+}
+
+function parseInlineDestTitle(text, i) {
+  const n = text.length;
+  let j = skipWs(text, i + 1);
+  if (j >= n) return null;
+  const d = parseLinkDest(text, j, n);
+  if (!d) return null;
+  j = skipWs(text, d.j);
+  if (j >= n) return null;
+  return parseLinkTitle(text, j, n, d.dest);
 }
 
 // Try to form a link or image starting at text[i] ('[' or '!' + '[').
@@ -1278,27 +1283,6 @@ function scanEmphasis(opener, k, text) {
   return null;
 }
 
-// Scan forward from a '~' opener for a matching closer. `o` is the opener
-// length (1 or 2). Returns {closer, bPrime} or null.
-function scanDel(opener, o) {
-  let p = o;
-  let x = opener.next;
-  while (x) {
-    if (x.t === 1 && x.ch === '~' && !x.masked && x.n > 0) {
-      const cls = scanClassify(x);
-      if (cls === null) { x = x.next; continue; }
-      if (cls === 'open') { p += x.n; x = x.next; continue; }
-      // every closer run subtracts from the balance, whatever its
-      // length (a single '~' closer inside a '~~' span still counts);
-      // only the run where the balance hits zero becomes the closer
-      p -= x.n;
-      if (p > 0) { x = x.next; continue; }
-      return { closer: x, bPrime: Math.min(x.n, x.n + p) };
-    }
-    x = x.next;
-  }
-  return null;
-}
 
 // Recompute a delimiter node's canOpen/canClose from its before/after
 // characters (the CommonMark flanking rules used at creation).
@@ -1359,43 +1343,61 @@ function processSpanChildren(span, text) {
 // `dummy`, following marked's left-to-right token order: at each delimiter
 // run, try to form its span; on failure the run stays literal (and stays
 // available as a candidate for later openers). `text` is the inline source.
+function emphasisHit(cur, text) {
+  if (!ldelimGate(cur).pass) return null;
+  let hit = null;
+  let kk = 0;
+  for (let k = cur.n; k >= 1; k--) {
+    const r = scanEmphasis(cur, k, text);
+    if (r) { hit = r; kk = k; break; }
+  }
+  if (!hit) return null;
+  const strip = hit.minKB % 2 === 1 ? 1 : 2;
+  return wrapScan(cur, hit.closer, kk, hit.bPrime, strip, hit.minKB % 2 === 0, false);
+}
+
+function delHit(cur, text) {
+  if (!ldelimGate(cur).pass) return null;
+  const o = Math.min(cur.n, 2);
+  let p = o;
+  let x = cur.next;
+  let hit = null;
+  while (x) {
+    if (x.t === 1 && x.ch === '~' && !x.masked && x.n > 0) {
+      const cls = scanClassify(x);
+      if (cls === null) { x = x.next; continue; }
+      if (cls === 'open') { p += x.n; x = x.next; continue; }
+      // every closer run subtracts from the balance, whatever its
+      // length (a single '~' closer inside a '~~' span still counts);
+      // only the run where the balance hits zero becomes the closer
+      p -= x.n;
+      if (p > 0) { x = x.next; continue; }
+      hit = { closer: x, bPrime: Math.min(x.n, x.n + p) };
+      break;
+    }
+    x = x.next;
+  }
+  if (!hit) return null;
+  return wrapScan(cur, hit.closer, o, hit.bPrime, o, false, true);
+}
+
 function processEmphasis(dummy, text) {
   let cur = dummy.next;
   while (cur) {
     const next = cur.next;
     if (cur.t === 1 && !cur.masked && cur.n > 0) {
-      if ((cur.ch === '*' || cur.ch === '_') && cur.canOpen) {
-        // LDelim gate: enter the scan unless the character after the
-        // opener is punctuation while the character before it is a word
-        // character
-        if (ldelimGate(cur).pass) {
-          let hit = null;
-          let kk = 0;
-          for (let k = cur.n; k >= 1; k--) {
-            const r = scanEmphasis(cur, k, text);
-            if (r) { hit = r; kk = k; break; }
-          }
-          if (hit) {
-            const strip = hit.minKB % 2 === 1 ? 1 : 2;
-            const span = wrapScan(cur, hit.closer, kk, hit.bPrime, strip, hit.minKB % 2 === 0, false);
-            // recurse into the span's children (marked re-tokenizes them)
-            processSpanChildren(span, text);
-            // continue after the span (its closer leftover, if any, is next)
-            cur = span.next;
-            continue;
-          }
-        }
-      } else if (cur.ch === '~' && cur.canOpen) {
-        if (ldelimGate(cur).pass) {
-          const o = Math.min(cur.n, 2);
-          const hit = scanDel(cur, o);
-          if (hit) {
-            const span = wrapScan(cur, hit.closer, o, hit.bPrime, o, false, true);
-            processSpanChildren(span, text);
-            cur = span.next;
-            continue;
-          }
-        }
+      let span = null;
+      // LDelim gate: enter the scan unless the character after the
+      // opener is punctuation while the character before it is a word
+      // character
+      if ((cur.ch === '*' || cur.ch === '_') && cur.canOpen) span = emphasisHit(cur, text);
+      else if (cur.ch === '~' && cur.canOpen) span = delHit(cur, text);
+      if (span) {
+        // recurse into the span's children (marked re-tokenizes them)
+        processSpanChildren(span, text);
+        // continue after the span (its closer leftover, if any, is next)
+        cur = span.next;
+        continue;
       }
     }
     cur = next;
@@ -1404,31 +1406,32 @@ function processEmphasis(dummy, text) {
 
 function renderNodeList(nodes) {
   const parts = [];
-  for (const nd of nodes) parts.push(renderNode(nd));
-  return parts.join('');
-}
-
-function renderNode(nd) {
-  switch (nd.t) {
-    case 0: return renderText(nd.s);
-    case 1: return nd.ch.repeat(nd.n);
-    case 2:
-      if (nd.href === null) return nd.html;
-      return '<a href="' + escNoEnc(nd.href) + '"' + titleAttr(nd.title) + '>' + nd.html + '</a>';
-    case 3:
-      if (nd.src === null) return nd.alt;
-      return '<img src="' + escNoEnc(nd.src) + '" alt="' + nd.alt + '"' + titleAttr(nd.title) + '>';
-    case 4: return '<code>' + escAll(nd.s) + '</code>';
-    case 5: return nd.s;
-    case 6: return '<br>';
-    case 7: {
-      const inner = renderNodeList(nd.children);
-      if (nd.del) return '<del>' + inner + '</del>';
-      return nd.strong ? '<strong>' + inner + '</strong>' : '<em>' + inner + '</em>';
+  for (const nd of nodes) {
+    switch (nd.t) {
+      case 0: parts.push(renderText(nd.s)); break;
+      case 1: parts.push(nd.ch.repeat(nd.n)); break;
+      case 2:
+        if (nd.href === null) parts.push(nd.html);
+        else parts.push('<a href="' + escNoEnc(nd.href) + '"' + titleAttr(nd.title) + '>' + nd.html + '</a>');
+        break;
+      case 3:
+        if (nd.src === null) parts.push(nd.alt);
+        else parts.push('<img src="' + escNoEnc(nd.src) + '" alt="' + nd.alt + '"' + titleAttr(nd.title) + '>');
+        break;
+      case 4: parts.push('<code>' + escAll(nd.s) + '</code>'); break;
+      case 5: parts.push(nd.s); break;
+      case 6: parts.push('<br>'); break;
+      case 7: {
+        const inner = renderNodeList(nd.children);
+        if (nd.del) parts.push('<del>' + inner + '</del>');
+        else parts.push(nd.strong ? '<strong>' + inner + '</strong>' : '<em>' + inner + '</em>');
+        break;
+      }
+      case 8: parts.push('<a href="' + escAll(nd.href) + '">' + escAll(nd.text) + '</a>'); break;
+      default: break;
     }
-    case 8: return '<a href="' + escAll(nd.href) + '">' + escAll(nd.text) + '</a>';
-    default: return '';
   }
+  return parts.join('');
 }
 
 // The optional title attribute for a link or image, already escaped.
@@ -1849,16 +1852,33 @@ function skipCursorSpaces(cursor) {
 function saveCursor(cursor) { return { i: cursor.i, col: cursor.col, pend: cursor.pend, baseCol: cursor.baseCol || 0 }; }
 function restoreCursor(cursor, st) { cursor.i = st.i; cursor.col = st.col; cursor.pend = st.pend; cursor.baseCol = st.baseCol; }
 function isBlankCursor(cursor) {
-  const st = saveCursor(cursor);
-  skipCursorSpaces(cursor);
-  const blank = cursor.i >= cursor.s.length;
-  restoreCursor(cursor, st);
-  return blank;
+  // local-state scan: identical to save/skip/restore, but touches no
+  // cursor fields and allocates nothing
+  const s = cursor.s;
+  let i = cursor.i, col = cursor.col, pend = cursor.pend;
+  for (;;) {
+    const c = pend > 0 ? ' ' : (i < s.length ? s[i] : undefined);
+    if (c !== ' ' && c !== '\t') break;
+    if (pend > 0) { pend--; col++; }
+    else if (s[i] === '\t') { pend = 3 - (col & 3); i++; col++; }
+    else { i++; col++; }
+  }
+  return i >= s.length;
 }
 function indentCursor(cursor) {
-  const st = saveCursor(cursor);
-  const n = skipCursorSpaces(cursor);
-  restoreCursor(cursor, st);
+  // columns of leading whitespace, computed on locals (same state
+  // machine as skipCursorSpaces, without touching the cursor)
+  const s = cursor.s;
+  let i = cursor.i, col = cursor.col, pend = cursor.pend;
+  let n = 0;
+  for (;;) {
+    const c = pend > 0 ? ' ' : (i < s.length ? s[i] : undefined);
+    if (c !== ' ' && c !== '\t') break;
+    if (pend > 0) { pend--; col++; }
+    else if (s[i] === '\t') { pend = 3 - (col & 3); i++; col++; }
+    else { i++; col++; }
+    n++;
+  }
   return n;
 }
 // The remaining line content from the cursor, a partially consumed tab
@@ -2193,11 +2213,9 @@ function tagNameAfter(s, j) {
 // Determine the HTML block type (1-7) for a line starting at the cursor,
 // or 0 when the line does not start an HTML block. The cursor is positioned
 // after at most 3 spaces of indentation.
-function htmlBlockType(cursor) {
-  if (cursor.pend > 0) return 0;
-  const s = cursor.s;
-  let i = cursor.i;
-  // note: cursor.pend is 0 here (we only call this when the cursor is at a real char)
+function htmlBlockType(s, i, pend) {
+  if (pend > 0) return 0;
+  // note: pend is 0 here (we only call this when the cursor is at a real char)
   if (i >= s.length || s[i] !== '<') return 0;
   const rest = s.slice(i + 1);
   const low = rest.toLowerCase();
@@ -2243,28 +2261,34 @@ function htmlBlockEnds(type, line) {
 }
 
 // Is the line (at the cursor) a setext underline? Returns 1 for '=', 2 for '-', else 0.
-function setextLevel(cursor) {
-  if (cursor.pend > 0) return 0;
+function setextLevel(s, i, col, pend) {
+  if (pend > 0) return 0;
   // a setext underline is indented at most 3 columns
-  if (indentCursor(cursor) > 3) return 0;
-  const s = cursor.s;
-  let i = cursor.i;
-  while (i < s.length && (s[i] === ' ' || s[i] === '\t')) i++;
-  if (i >= s.length) return 0;
-  const c = s[i];
+  let j = i, ccol = col, pp = pend;
+  let n = 0;
+  for (;;) {
+    const c = pp > 0 ? ' ' : (j < s.length ? s[j] : undefined);
+    if (c !== ' ' && c !== '\t') break;
+    if (pp > 0) { pp--; ccol++; }
+    else if (s[j] === '\t') { pp = 3 - (ccol & 3); j++; ccol++; }
+    else { j++; ccol++; }
+    n++;
+  }
+  if (n > 3) return 0;
+  while (j < s.length && (s[j] === ' ' || s[j] === '\t')) j++;
+  if (j >= s.length) return 0;
+  const c = s[j];
   if (c !== '=' && c !== '-') return 0;
-  i++;
-  while (i < s.length && s[i] === c) i++;
-  while (i < s.length && (s[i] === ' ' || s[i] === '\t')) i++;
-  if (i < s.length) return 0;
+  j++;
+  while (j < s.length && s[j] === c) j++;
+  while (j < s.length && (s[j] === ' ' || s[j] === '\t')) j++;
+  if (j < s.length) return 0;
   return c === '=' ? 1 : 2;
 }
 
 // Is the line (at the cursor) a thematic break?
-function isThematicBreak(cursor) {
-  const s = cursor.s;
-  if (cursor.pend > 0) return false;
-  let i = cursor.i;
+function isThematicBreak(s, i, pend) {
+  if (pend > 0) return false;
   let c = null;
   let count = 0;
   while (i < s.length) {
@@ -2365,85 +2389,96 @@ function parseBlocks(src) {
   // Does the line at the cursor start a block that can interrupt a paragraph?
   // parentIsItem: the paragraph's direct parent is a list item, in which
   // case an ordered list may interrupt it whatever its start number.
-  function startsBlockInterruptingPara(cursor, parentIsItem) {
-    const indent = indentCursor(cursor);
+  function startsBlockInterruptingPara(s, i, col, pend, parentIsItem) {
+    // pure predicate: skip leading whitespace on locals
+    let j = i, ccol = col, pp = pend, indent = 0;
+    for (;;) {
+      const c = pp > 0 ? ' ' : (j < s.length ? s[j] : undefined);
+      if (c !== ' ' && c !== '\t') break;
+      if (pp > 0) { pp--; ccol++; }
+      else if (s[j] === '\t') { pp = 3 - (ccol & 3); j++; ccol++; }
+      else { j++; ccol++; }
+      indent++;
+    }
     if (indent > 3) return false;
-    const saved = saveCursor(cursor);
-    skipCursorSpaces(cursor);
-    const c = peekCursor(cursor);
+    const c = pp > 0 ? ' ' : (j < s.length ? s[j] : undefined);
     let r = false;
     if (c === '#') {
-      let idx = cursor.i;
+      let idx = j;
       let level = 0;
-      while (idx < cursor.s.length && cursor.s[idx] === '#') { level++; idx++; }
+      while (idx < s.length && s[idx] === '#') { level++; idx++; }
       if (level >= 1 && level <= 6) {
-        const a = idx < cursor.s.length ? cursor.s[idx] : undefined;
+        const a = idx < s.length ? s[idx] : undefined;
         if (a === undefined || a === ' ' || a === '\t') r = true;
       }
     } else if (c === '`' || c === '~') {
-      let idx = cursor.i;
-      while (idx < cursor.s.length && cursor.s[idx] === c) idx++;
-      if (idx - cursor.i >= 3) {
+      let idx = j;
+      while (idx < s.length && s[idx] === c) idx++;
+      if (idx - j >= 3) {
         // a backtick fence whose info string contains a backtick is not
         // a fence at all, so it cannot interrupt a paragraph
-        if (c === '`' && cursor.s.slice(idx).indexOf('`') >= 0) r = false;
+        if (c === '`' && s.slice(idx).indexOf('`') >= 0) r = false;
         else r = true;
       }
     } else if (c === '<') {
-      const t = htmlBlockType(cursor);
+      const t = htmlBlockType(s, j, pp);
       if (t >= 1 && t <= 6) r = true;
     } else if (c === '>') {
       r = true;
     } else if (c === '*' || c === '-' || c === '+' || c === '_') {
-      if (isThematicBreak(cursor)) r = true;
+      if (isThematicBreak(s, j, pp)) r = true;
       else {
-        const li = matchListItem(cursor, !parentIsItem);
+        const li = matchListItem(s, j, ccol, pp, !parentIsItem);
         if (li && !li.empty) r = true;
       }
     } else if (c !== undefined && c >= '0' && c <= '9') {
-      const li = matchListItem(cursor, !parentIsItem);
+      const li = matchListItem(s, j, ccol, pp, !parentIsItem);
       if (li && !li.empty) r = true;
     }
-    restoreCursor(cursor, saved);
     return r;
   }
 
   // Does the line at the cursor start a block (ending a table's rows)?
-  function startsBlockEndingTable(cursor) {
-    const indent = indentCursor(cursor);
+  function startsBlockEndingTable(s, i, col, pend) {
+    let j = i, ccol = col, pp = pend, indent = 0;
+    for (;;) {
+      const c = pp > 0 ? ' ' : (j < s.length ? s[j] : undefined);
+      if (c !== ' ' && c !== '\t') break;
+      if (pp > 0) { pp--; ccol++; }
+      else if (s[j] === '\t') { pp = 3 - (ccol & 3); j++; ccol++; }
+      else { j++; ccol++; }
+      indent++;
+    }
     if (indent >= 4) return true;
     if (indent > 3) return false;
-    const saved = saveCursor(cursor);
-    skipCursorSpaces(cursor);
-    const c = peekCursor(cursor);
+    const c = pp > 0 ? ' ' : (j < s.length ? s[j] : undefined);
     let r = false;
     if (c === '#') {
-      let idx = cursor.i;
+      let idx = j;
       let level = 0;
-      while (idx < cursor.s.length && cursor.s[idx] === '#') { level++; idx++; }
+      while (idx < s.length && s[idx] === '#') { level++; idx++; }
       if (level >= 1 && level <= 6) {
-        const a = idx < cursor.s.length ? cursor.s[idx] : undefined;
+        const a = idx < s.length ? s[idx] : undefined;
         if (a === undefined || a === ' ' || a === '\t') r = true;
       }
     } else if (c === '`' || c === '~') {
-      let idx = cursor.i;
-      while (idx < cursor.s.length && cursor.s[idx] === c) idx++;
-      if (idx - cursor.i >= 3) {
-        if (c === '`' && cursor.s.slice(idx).indexOf('`') >= 0) r = false;
+      let idx = j;
+      while (idx < s.length && s[idx] === c) idx++;
+      if (idx - j >= 3) {
+        if (c === '`' && s.slice(idx).indexOf('`') >= 0) r = false;
         else r = true;
       }
     } else if (c === '<') {
-      const t = htmlBlockType(cursor);
+      const t = htmlBlockType(s, j, pp);
       if (t >= 1 && t <= 6) r = true;
     } else if (c === '>') {
       r = true;
     } else if (c === '*' || c === '-' || c === '_') {
-      if (isThematicBreak(cursor)) r = true;
-      else if (matchListItem(cursor, false)) r = true;
+      if (isThematicBreak(s, j, pp)) r = true;
+      else if (matchListItem(s, j, ccol, pp, false)) r = true;
     } else if (c !== undefined && c >= '0' && c <= '9') {
-      if (matchListItem(cursor, false)) r = true;
+      if (matchListItem(s, j, ccol, pp, false)) r = true;
     }
-    restoreCursor(cursor, saved);
     return r;
   }
 
@@ -2451,14 +2486,19 @@ function parseBlocks(src) {
   // Returns {ordered, delim, start, contentIndent, contentStart} or null.
   // When forInterrupt is true, an empty bullet item or an ordered item not
   // starting with 1 does not count.
-  function matchListItem(cursor, forInterrupt) {
-    const s = cursor.s;
-    const saved = saveCursor(cursor);
-    skipCursorSpaces(cursor);
-    if (cursor.pend > 0) { restoreCursor(cursor, saved); return null; }
-    const i0 = cursor.i;
+  function matchListItem(s, i, col, pend, forInterrupt) {
+    // pure predicate: works on locals, never touches the cursor
+    for (;;) {
+      const c = pend > 0 ? ' ' : (i < s.length ? s[i] : undefined);
+      if (c !== ' ' && c !== '\t') break;
+      if (pend > 0) { pend--; col++; }
+      else if (s[i] === '\t') { pend = 3 - (col & 3); i++; col++; }
+      else { i++; col++; }
+    }
+    if (pend > 0) return null;
+    const i0 = i;
     const c = s[i0];
-    if (c === undefined) { restoreCursor(cursor, saved); return null; }
+    if (c === undefined) return null;
     let ordered = false;
     let delim = null;
     let start = 0;
@@ -2471,27 +2511,26 @@ function parseBlocks(src) {
       let digits = 0;
       let num = 0;
       while (j < s.length && s[j] >= '0' && s[j] <= '9' && digits < 10) { num = num * 10 + (s.charCodeAt(j) - 48); digits++; j++; }
-      if (digits === 0 || digits > 9) { restoreCursor(cursor, saved); return null; }
-      if (j >= s.length || (s[j] !== '.' && s[j] !== ')')) { restoreCursor(cursor, saved); return null; }
+      if (digits === 0 || digits > 9) return null;
+      if (j >= s.length || (s[j] !== '.' && s[j] !== ')')) return null;
       ordered = true;
       delim = s[j];
       start = num;
       markerEnd = j + 1;
-    } else { restoreCursor(cursor, saved); return null; }
+    } else return null;
     // the marker must be followed by a space/tab or EOL
     if (markerEnd >= s.length) {
       // empty item: content indent is marker width + 1; an empty item
       // never interrupts a paragraph
-      if (forInterrupt) { restoreCursor(cursor, saved); return null; }
-      restoreCursor(cursor, saved);
+      if (forInterrupt) return null;
       return { ordered, delim, start, contentIndent: (markerEnd - i0) + 1, contentStart: markerEnd, empty: true };
     }
     const after = s[markerEnd];
-    if (after !== ' ' && after !== '\t') { restoreCursor(cursor, saved); return null; }
+    if (after !== ' ' && after !== '\t') return null;
     // count the whitespace columns after the marker (tabs expanded by column)
     let wsCols = 0;
     let wj = markerEnd;
-    let wcol = cursor.col + (markerEnd - i0);
+    let wcol = col + (markerEnd - i0);
     while (wj < s.length) {
       const ch = s[wj];
       if (ch === ' ') { wsCols++; wj++; wcol++; continue; }
@@ -2510,15 +2549,13 @@ function parseBlocks(src) {
     // empty item: only whitespace to EOL; an empty item never
     // interrupts a paragraph
     if (wj >= s.length) {
-      if (forInterrupt) { restoreCursor(cursor, saved); return null; }
-      restoreCursor(cursor, saved);
+      if (forInterrupt) return null;
       return { ordered, delim, start, contentIndent: (markerEnd - i0) + 1, contentStart: wj, empty: true };
     }
     if (forInterrupt && !ordered) {
       // bullet non-empty: ok
     }
-    if (forInterrupt && ordered && start !== 1) { restoreCursor(cursor, saved); return null; }
-    restoreCursor(cursor, saved);
+    if (forInterrupt && ordered && start !== 1) return null;
     return { ordered, delim, start, contentIndent, contentStart: wj, empty: false };
   }
 
@@ -2588,8 +2625,8 @@ function parseBlocks(src) {
       // a list item marker ends a lazy continuation only when it can
       // start a list item (indent <= 3); at indent >= 4 it is code or
       // paragraph text, not a marker
-      const lazyItem = indentCursor(cursor) <= 3 ? matchListItem(cursor, false) : null;
-      if (top.t === 'para' && stack.length - 1 > depth + 1 && !isBlankLine && !startsBlockInterruptingPara(cursor, stack[stack.length - 2] && stack[stack.length - 2].t === 'item') && !lazyItem) {
+      const lazyItem = indentCursor(cursor) <= 3 ? matchListItem(cursor.s, cursor.i, cursor.col, cursor.pend, false) : null;
+      if (top.t === 'para' && stack.length - 1 > depth + 1 && !isBlankLine && !startsBlockInterruptingPara(cursor.s, cursor.i, cursor.col, cursor.pend, stack[stack.length - 2] && stack[stack.length - 2].t === 'item') && !lazyItem) {
         isLazyPara = true;
       }
     }
@@ -2769,7 +2806,7 @@ function parseBlocks(src) {
       continue;
     }
     if (tip.t === 'table') {
-      if (!startsBlockEndingTable(cursor)) {
+      if (!startsBlockEndingTable(cursor.s, cursor.i, cursor.col, cursor.pend)) {
         tip.rows.push(splitTableRow(restCursor(cursor)));
         markNonBlank();
         continue;
@@ -2778,7 +2815,7 @@ function parseBlocks(src) {
       tip = stack[stack.length - 1];
     }
     if (tip.t === 'para') {
-      let sl = setextLevel(cursor);
+      let sl = setextLevel(cursor.s, cursor.i, cursor.col, cursor.pend);
       // a setext underline that is a lazy continuation inside a blockquote
       // cannot form a heading: a level-1 underline is added to the
       // paragraph as an indented line, a level-2 underline is a
@@ -2857,7 +2894,7 @@ function parseBlocks(src) {
             markNonBlank();
             continue;
           }
-        } else if (startsBlockInterruptingPara(cursor, stack[stack.length - 2] && stack[stack.length - 2].t === 'item')) {
+        } else if (startsBlockInterruptingPara(cursor.s, cursor.i, cursor.col, cursor.pend, stack[stack.length - 2] && stack[stack.length - 2].t === 'item')) {
           closeBlock(stack.pop());
           tip = stack[stack.length - 1];
           // fall through to phase 3
@@ -2900,8 +2937,8 @@ function parseBlocks(src) {
           const saved0 = saveCursor(cursor);
           skipCursorSpaces(cursor);
           // a thematic break takes precedence over a list item
-          if (!isThematicBreak(cursor)) {
-            const li0 = matchListItem(cursor, false);
+          if (!isThematicBreak(cursor.s, cursor.i, cursor.pend)) {
+            const li0 = matchListItem(cursor.s, cursor.i, cursor.col, cursor.pend, false);
             if (li0 && li0.ordered === container.ordered && li0.delim === container.delim) {
               matched = li0;
               leadCols = cursor.col - saved0.col;
@@ -2992,7 +3029,7 @@ function parseBlocks(src) {
         }
         // HTML block
         if (c === '<') {
-          const t = htmlBlockType(cursor);
+          const t = htmlBlockType(cursor.s, cursor.i, cursor.pend);
           if (t >= 1 && t <= 7) {
             restoreCursor(cursor, iterStart);
             const firstLine = restCursor(cursor);
@@ -3010,7 +3047,7 @@ function parseBlocks(src) {
         }
         // thematic break
         if (c === '*' || c === '-' || c === '_') {
-          if (isThematicBreak(cursor)) {
+          if (isThematicBreak(cursor.s, cursor.i, cursor.pend)) {
             const hr = { t: 'hr', parent: null };
             addChild(container, hr);
             markNonBlank();
@@ -3019,7 +3056,7 @@ function parseBlocks(src) {
         }
         // list item
         if (c === '-' || c === '+' || c === '*' || (c !== undefined && c >= '0' && c <= '9')) {
-          const li2 = matchListItem(cursor, false);
+          const li2 = matchListItem(cursor.s, cursor.i, cursor.col, cursor.pend, false);
           if (li2) {
             // a list of a different type ends the current list
             if (container.t === 'list') {
