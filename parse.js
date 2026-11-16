@@ -5,7 +5,9 @@
 // parse(); blocks are built by parseBlocks() and rendered by renderDoc().
 
 export function parse(markdown) {
-  const text = String(markdown).replace(/\r\n?/g, '\n');
+  const s = String(markdown);
+  // most inputs have no CR at all: skip the full-copy replace then
+  const text = s.indexOf('\r') < 0 ? s : s.replace(/\r\n?/g, '\n');
   docInLink = false;
   const state = parseBlocks(text);
   return renderDoc(state.doc, state.linkRefs);
@@ -168,7 +170,9 @@ const ALNUM_RE = /[\p{L}\p{N}]/u;
 const HTML_ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 
 // Escape &, <, >, ", ' — every & is escaped.
+const ESC_RE = /[&<>"']/;
 function escAll(s) {
+  if (!ESC_RE.test(s)) return s;
   let out = '';
   let last = 0;
   for (let i = 0; i < s.length; i++) {
@@ -181,6 +185,7 @@ function escAll(s) {
 // Escape <, >, ", ' and & — but leave & alone when it starts a valid
 // entity reference (&name; &#123; &#x1f; with the digit limits marked uses).
 function escNoEnc(s) {
+  if (!ESC_RE.test(s)) return s;
   let out = '';
   let last = 0;
   for (let i = 0; i < s.length; i++) {
@@ -197,11 +202,6 @@ function escNoEnc(s) {
     last = i + 1;
   }
   return last === 0 ? s : out + s.slice(last);
-}
-
-function isWordCh(c) {
-  const code = c.charCodeAt(0);
-  return (code >= 48 && code <= 57) || (code >= 65 && code <= 90) || (code >= 97 && code <= 122) || c === '_';
 }
 
 // Numeric entity digit value for a character in the given base (10 or 16),
@@ -246,7 +246,11 @@ function entityAt(s, i) {
   }
   // named: & + word chars + ;
   let j = i + 1;
-  while (j < s.length && isWordCh(s[j])) j++;
+  while (j < s.length) {
+    const cc = s.charCodeAt(j);
+    if ((cc >= 48 && cc <= 57) || (cc >= 65 && cc <= 90) || (cc >= 97 && cc <= 122) || cc === 95) j++;
+    else break;
+  }
   if (j === i + 1 || j >= s.length || s[j] !== ';') return null;
   return { len: j + 1 - i, out: s.slice(i, j + 1) };
 }
@@ -295,6 +299,7 @@ function unescapeStr(s) {
 // any valid entity reference in place (named references pass through
 // unchanged; numeric ones decode to the character, already escaped).
 function renderText(s) {
+  if (!ESC_RE.test(s)) return s;
   let out = '';
   let last = 0;
   for (let i = 0; i < s.length; i++) {
@@ -361,13 +366,12 @@ function scanLabel(text, openIdx) {
       let m = k;
       let found = -1;
       while (m < n) {
-        if (text[m] === '`') {
-          let e = m;
-          while (e < n && text[e] === '`') e++;
-          found = e;
-          break;
-        }
-        m++;
+        m = text.indexOf('`', m);
+        if (m < 0) break;
+        let e = m;
+        while (e < n && text[e] === '`') e++;
+        found = e;
+        break;
       }
       if (found < 0) {
         if (run >= 2 && k < n && text[k] === ']') { j = k; continue; }
@@ -584,18 +588,18 @@ function tryCodeSpan(text, i) {
   const run = k - i;
   let m = k;
   while (m < n) {
-    if (text[m] === '`') {
-      let e = m;
-      while (e < n && text[e] === '`') e++;
-      if (e - m === run) {
-        let content = text.slice(k, m).replace(/\n/g, ' ');
-        if (content.length >= 2 && content[0] === ' ' && content[content.length - 1] === ' ' && /[^ ]/.test(content)) {
-          content = content.slice(1, -1);
-        }
-        return { end: e, node: { t: 4, s: content, prev: null, next: null } };
+    m = text.indexOf('`', m);
+    if (m < 0) break;
+    let e = m;
+    while (e < n && text[e] === '`') e++;
+    if (e - m === run) {
+      let content = text.slice(k, m).replace(/\n/g, ' ');
+      if (content.length >= 2 && content[0] === ' ' && content[content.length - 1] === ' ' && /[^ ]/.test(content)) {
+        content = content.slice(1, -1);
       }
-      m = e;
-    } else m++;
+      return { end: e, node: { t: 4, s: content, prev: null, next: null } };
+    }
+    m = e;
   }
   return null;
 }
@@ -1033,11 +1037,16 @@ function maskDestEnd(text, i) {
 
 // Ranges [start, end) of the inline text that the emphasis scan cannot
 // see. Scanned left to right, non-overlapping, sorted.
+const MASK_JUMP_RE = /[\\`[<]/g;
 function maskedSpans(text, linkRefs) {
   const n = text.length;
   const spans = [];
   let i = 0;
   while (i < n) {
+    MASK_JUMP_RE.lastIndex = i;
+    const jm = MASK_JUMP_RE.exec(text);
+    if (!jm) break;
+    i = jm.index;
     const c = text[i];
     // an escaped character cannot open a code span or a link label
     if (c === '\\' && i + 1 < n && ASCII_PUNCT.indexOf(text[i + 1]) >= 0) { i += 2; continue; }
@@ -1073,9 +1082,10 @@ function maskedSpans(text, linkRefs) {
     }
     if (c === '<') {
       if (i + 1 < n && text[i + 1] !== ' ') {
-        let j = i + 1;
-        while (j < n && text[j] !== '>' && text[j] !== '<') j++;
-        if (j < n && text[j] === '>') { spans.push([i, j + 1]); i = j + 1; continue; }
+        // first terminator wins: '>' closes the tag, '<' aborts it
+        const gt = text.indexOf('>', i + 1);
+        const lt = text.indexOf('<', i + 1);
+        if (gt >= 0 && (lt < 0 || gt < lt)) { spans.push([i, gt + 1]); i = gt + 1; continue; }
       }
       i++;
       continue;
@@ -1398,11 +1408,6 @@ function renderNodeList(nodes) {
   return parts.join('');
 }
 
-// The optional title attribute for a link or image, already escaped.
-function titleAttr(title) {
-  return title !== null ? ' title="' + escNoEnc(title) + '"' : '';
-}
-
 function renderNode(nd) {
   switch (nd.t) {
     case 0: return renderText(nd.s);
@@ -1426,12 +1431,112 @@ function renderNode(nd) {
   }
 }
 
+// The optional title attribute for a link or image, already escaped.
+function titleAttr(title) {
+  return title !== null ? ' title="' + escNoEnc(title) + '"' : '';
+}
+
+// Try a GFM extended autolink at text[i]; i is a candidate start found
+// by AUTOLINK_RE, so a scheme/www. match is guaranteed. Returns the index
+// just past the autolink, or -1 when no autolink forms (the caller then
+// emits text[i] as plain text). pushNode/pushText/hasOpenDelim are the
+// inline scanner's closures; docInLink is module state.
+function tryExtAutolink(text, i, n, inLink, prevCh, hasOpenDelim, pushNode, pushText) {
+  if (inLink || docInLink) return -1;
+  const c = text[i];
+if (!(inLink || docInLink) && (c === 'w' || c === 'W') && text.startsWith('www.', i)) {
+  const okPrev = prevCh === null || isSpaceCh(prevCh) || prevCh === '(' || prevCh === '*' || prevCh === '_' || prevCh === '~';
+  if (okPrev) {
+    const c1 = text[i + 4];
+    if (c1 !== undefined && ((c1 >= 'a' && c1 <= 'z') || (c1 >= 'A' && c1 <= 'Z') || (c1 >= '0' && c1 <= '9') || c1 === '_' || c1 === '-')) {
+      const url = scanExtUrl(text, i);
+      if (url) {
+        const href = cleanUrl('http://' + url);
+        if (href !== null) {
+          pushNode({ t: 8, href, text: url, prev: null, next: null });
+          return i + url.length;
+        }
+      }
+    }
+  }
+  return -1;
+}
+if (!(inLink || docInLink) && (c === 'h' || c === 'H' || c === 'f' || c === 'F')) {
+  const rest = text.slice(i, i + 8).toLowerCase();
+  let schemeLen = 0;
+  if (rest.startsWith('https://')) schemeLen = 8;
+  else if (rest.startsWith('http://')) schemeLen = 7;
+  else if (rest.startsWith('ftp://')) schemeLen = 6;
+  if (schemeLen > 0) {
+    const url = scanExtUrl(text, i);
+    if (url) {
+      const href = cleanUrl(url);
+      if (href !== null) {
+        pushNode({ t: 8, href, text: url, prev: null, next: null });
+        return i + url.length;
+      }
+    }
+  }
+  return -1;
+}
+if (!(inLink || docInLink) && c === 'x' && text.startsWith('xmpp:', i)) {
+  // the only bare-scheme autolink: literal lowercase xmpp: + an
+  // email, optionally + / + one path segment ([A-Za-z0-9@.]+,
+  // trailing dots trimmed)
+  const okPrev = prevCh === null || isSpaceCh(prevCh) || prevCh === '(' || prevCh === '*' || prevCh === '_' || prevCh === '~';
+  if (okPrev) {
+    const em = matchEmail(text, i + 5, hasOpenDelim);
+    if (em) {
+      let end = em.end;
+      if (text[end] === '/') {
+        let k = end + 1;
+        while (k < n) {
+          const ch = text[k];
+          if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch === '@' || ch === '.') k++;
+          else break;
+        }
+        if (k > end + 1) {
+          let e2 = k;
+          while (e2 > end + 1 && text[e2 - 1] === '.') e2--;
+          if (e2 > end + 1) end = e2;
+        }
+      }
+      const full = text.slice(i, end);
+      const href = cleanUrl(full);
+      if (href !== null) {
+        pushNode({ t: 8, href, text: full, prev: null, next: null });
+        return end;
+      }
+    }
+  }
+  return -1;
+}
+if (!(inLink || docInLink) && c === 'm' && text.startsWith('mailto:', i)) {
+  const okPrev = prevCh === null || isSpaceCh(prevCh) || prevCh === '(' || prevCh === '*' || prevCh === '_' || prevCh === '~';
+  if (okPrev) {
+    const em = matchEmail(text, i + 7, hasOpenDelim);
+    if (em) {
+      const full = text.slice(i, em.end);
+      const href = cleanUrl('mailto:' + em.email);
+      if (href !== null) {
+        pushNode({ t: 8, href, text: full, prev: null, next: null });
+        return em.end;
+      }
+    }
+  }
+  return -1;
+}
+  return -1;
+}
+
 // Parse inline content to a node list. linkRefs is a Map of normalised label -> {dest, title}.
 function inlineToNodes(text, linkRefs, inLink) {
   const n = text.length;
   // ranges of this inline text that the emphasis scan cannot see
-  // (code spans, link-shaped spans, HTML tags, known reference links)
-  const maskSpans = maskedSpans(text, linkRefs);
+  // (code spans, link-shaped spans, HTML tags, known reference links).
+  // Only computable when a delimiter exists (nothing else reads the
+  // mask) and a mask opener exists (otherwise the span list is empty).
+  const maskSpans = (HAS_DELIM.test(text) && MASK_OPEN.test(text)) ? maskedSpans(text, linkRefs) : [];
   // a label's tokenization saves/restores the document-level inLink
   const savedDocInLink = inLink ? docInLink : null;
   const dummy = { t: -1, prev: null, next: null };
@@ -1474,8 +1579,34 @@ function inlineToNodes(text, linkRefs, inLink) {
     }
     return depth > 0;
   }
+  // Autolink candidate starts, found by one native scan. The main loop
+  // never stops at the letters w/h/f/m/x themselves.
+  const cands = [];
+  if (!inLink) {
+    AUTOLINK_RE.lastIndex = 0;
+    let am;
+    while ((am = AUTOLINK_RE.exec(text)) !== null) cands.push(am.index);
+  }
+  let ci = 0;
   let i = 0;
   while (i < n) {
+    JUMP_RE.lastIndex = i;
+    const jm = JUMP_RE.exec(text);
+    const jSpecial = jm ? jm.index : n;
+    while (ci < cands.length && cands[ci] < i) ci++;
+    const jCand = ci < cands.length ? cands[ci] : n;
+    const j = jSpecial < jCand ? jSpecial : jCand;
+    if (j > i) { pushText(text.slice(i, j)); i = j; }
+    if (i >= n) break;
+    if (jCand < jSpecial) {
+      const ni = tryExtAutolink(text, i, n, inLink, prevCh, hasOpenDelim, pushNode, pushText);
+      if (ni >= 0) { i = ni; continue; }
+      pushText(text[i]);
+      i++;
+      continue;
+    }
+
+    if (i >= n) break;
     const c = text[i];
     if (c === '`') {
       const cs = tryCodeSpan(text, i);
@@ -1619,100 +1750,6 @@ function inlineToNodes(text, linkRefs, inLink) {
       i++;
       continue;
     }
-    if (!(inLink || docInLink) && (c === 'w' || c === 'W') && text.startsWith('www.', i)) {
-      const okPrev = prevCh === null || isSpaceCh(prevCh) || prevCh === '(' || prevCh === '*' || prevCh === '_' || prevCh === '~';
-      if (okPrev) {
-        const c1 = text[i + 4];
-        if (c1 !== undefined && ((c1 >= 'a' && c1 <= 'z') || (c1 >= 'A' && c1 <= 'Z') || (c1 >= '0' && c1 <= '9') || c1 === '_' || c1 === '-')) {
-          const url = scanExtUrl(text, i);
-          if (url) {
-            const href = cleanUrl('http://' + url);
-            if (href !== null) {
-              pushNode({ t: 8, href, text: url, prev: null, next: null });
-              i += url.length;
-              continue;
-            }
-          }
-        }
-      }
-      pushText('w');
-      i++;
-      continue;
-    }
-    if (!(inLink || docInLink) && (c === 'h' || c === 'H' || c === 'f' || c === 'F')) {
-      const rest = text.slice(i, i + 8).toLowerCase();
-      let schemeLen = 0;
-      if (rest.startsWith('https://')) schemeLen = 8;
-      else if (rest.startsWith('http://')) schemeLen = 7;
-      else if (rest.startsWith('ftp://')) schemeLen = 6;
-      if (schemeLen > 0) {
-        const url = scanExtUrl(text, i);
-        if (url) {
-          const href = cleanUrl(url);
-          if (href !== null) {
-            pushNode({ t: 8, href, text: url, prev: null, next: null });
-            i += url.length;
-            continue;
-          }
-        }
-      }
-      pushText(c);
-      i++;
-      continue;
-    }
-    if (!(inLink || docInLink) && c === 'x' && text.startsWith('xmpp:', i)) {
-      // the only bare-scheme autolink: literal lowercase xmpp: + an
-      // email, optionally + / + one path segment ([A-Za-z0-9@.]+,
-      // trailing dots trimmed)
-      const okPrev = prevCh === null || isSpaceCh(prevCh) || prevCh === '(' || prevCh === '*' || prevCh === '_' || prevCh === '~';
-      if (okPrev) {
-        const em = matchEmail(text, i + 5, hasOpenDelim);
-        if (em) {
-          let end = em.end;
-          if (text[end] === '/') {
-            let k = end + 1;
-            while (k < n) {
-              const ch = text[k];
-              if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch === '@' || ch === '.') k++;
-              else break;
-            }
-            if (k > end + 1) {
-              let e2 = k;
-              while (e2 > end + 1 && text[e2 - 1] === '.') e2--;
-              if (e2 > end + 1) end = e2;
-            }
-          }
-          const full = text.slice(i, end);
-          const href = cleanUrl(full);
-          if (href !== null) {
-            pushNode({ t: 8, href, text: full, prev: null, next: null });
-            i = end;
-            continue;
-          }
-        }
-      }
-      pushText('x');
-      i++;
-      continue;
-    }
-    if (!(inLink || docInLink) && c === 'm' && text.startsWith('mailto:', i)) {
-      const okPrev = prevCh === null || isSpaceCh(prevCh) || prevCh === '(' || prevCh === '*' || prevCh === '_' || prevCh === '~';
-      if (okPrev) {
-        const em = matchEmail(text, i + 7, hasOpenDelim);
-        if (em) {
-          const full = text.slice(i, em.end);
-          const href = cleanUrl('mailto:' + em.email);
-          if (href !== null) {
-            pushNode({ t: 8, href, text: full, prev: null, next: null });
-            i = em.end;
-            continue;
-          }
-        }
-      }
-      pushText('m');
-      i++;
-      continue;
-    }
     pushText(c);
     i++;
   }
@@ -1728,7 +1765,24 @@ function inlineToNodes(text, linkRefs, inLink) {
 }
 
 // Parse inline content to HTML. linkRefs is a Map of normalised label -> {dest, title}.
+// Fast path: no markup char, no entity, no autolink trigger and no
+// two-spaces-before-newline hard break anywhere — the text then renders
+// as plain escaped text, with no node list, no emphasis scan, no masking.
+// NB: schemes are case-insensitive in the slow path (it lowercases
+// before testing), so the gate must match Https://, FTP:// etc too;
+// www./mailto:/xmpp: are lowercase-only there.
+const INLINE_CHARS = /[`*_[\]<\\!~&@]/;
+const INLINE_TRIG = /www\.|[Hh][Tt][Tt][Pp][Ss]?:\/\/|[Ff][Tt][Pp]:\/\/|mailto:|xmpp:|  \n/;
+const HAS_DELIM = /[*_~]/;
+const MASK_OPEN = /[`[<]/;
+// Jump table for the inline scanner: the next character that can start
+// markup. Ordinary letters ride inside bulk slices; autolink scheme
+// starts are pre-scanned separately (AUTOLINK_RE) so the loop never
+// stops at the letters w/h/f/m/x themselves.
+const JUMP_RE = /[`*_[\]<\\!~@\n]/g;
+const AUTOLINK_RE = /www\.|[Hh][Tt][Tt][Pp][Ss]?:\/\/|[Ff][Tt][Pp]:\/\/|mailto:|xmpp:/g;
 function inlineToHtml(text, linkRefs, inLink) {
+  if (!INLINE_CHARS.test(text) && !INLINE_TRIG.test(text)) return escAll(text);
   return renderNodeList(inlineToNodes(text, linkRefs, inLink));
 }
 
@@ -2099,7 +2153,10 @@ function delimiterAlign(cell) {
 }
 
 // Is the line a table delimiter row? Returns the alignments array or null.
+// Every delimiter cell needs at least one '-', so a line without one
+// cannot be a delimiter row.
 function parseDelimiterRow(line) {
+  if (line.indexOf('-') < 0) return null;
   const cells = splitTableRow(line);
   if (cells.length === 0) return null;
   const aligns = [];
@@ -2265,8 +2322,17 @@ function parseBlocks(src) {
   // Extract leading defs from a paragraph node, mutating its lines.
   // Returns true when lines remain.
   function extractDefsFromPara(node) {
+    // Definitions only ever start at the paragraph's start (after at
+    // most 3 spaces) with '['; anything else cannot contain one, so the
+    // join/split round-trip is skipped. When extractDefs finds nothing
+    // it returns the input string itself, so the lines are untouched.
+    const first = node.lines.length > 0 ? node.lines[0] : '';
+    let p = 0;
+    while (p < first.length && first[p] === ' ' && p < 3) p++;
+    if (p >= first.length || first[p] !== '[') return node.lines.length > 0;
     const text = node.lines.join('\n');
     const rest = extractDefs(text, linkRefs);
+    if (rest === text) return node.lines.length > 0;
     node.lines = rest === '' ? [] : rest.split('\n');
     return node.lines.length > 0;
   }

@@ -22,10 +22,17 @@ marked's `_backpedal` URL trimming).
 ## Speed
 
 On the practice set the parser produces byte-identical HTML for all 720
-cases (680 CommonMark/GFM spec cases plus 40 long README documents), and
-runs in ~475–575 ms on this machine against ~675–770 ms for marked itself on the
-same cases — about 1.3–1.4× faster. It is stateless per call: no caching across
-cases, no memo, nothing written to disk.
+cases (680 CommonMark/GFM spec cases plus 40 long README documents).
+Measured cold — one fresh `node` process rendering all 720 cases once,
+CPU time around the parse loop, interleaved runs against marked 18.1.3
+on this machine (Mon 2026-11-16): ours ~1.39–1.49 s CPU vs marked
+~1.47–1.51 s CPU, about 1.01–1.06×. The 40 README documents alone run
+about 1.06–1.09× faster than marked cold; the 680 spec cases about
+2.1×. Warm (third pass over the documents in one process) it is about
+1.9× faster than marked — the cold gap is V8 warm-up (our larger
+functions compile later than marked's), not steady-state speed.
+It is stateless per call: no caching across cases, no memo, nothing
+written to disk.
 
 ## Usage
 
