@@ -15,10 +15,18 @@ interface Case {
   markdown: string;
 }
 
-// Render every case in order, one pure parse() call per case.
+// Render every case in order, one pure parse() call per case. A single
+// case that throws is reported with its id and rethrown so a bad input
+// never silently produces a partial output file.
 function renderAll(cases: Case[]): string[] {
   const html: string[] = new Array(cases.length);
-  for (let i = 0; i < cases.length; i++) html[i] = parse(cases[i].markdown);
+  for (let i = 0; i < cases.length; i++) {
+    try {
+      html[i] = parse(cases[i].markdown);
+    } catch (e) {
+      throw new Error(`case ${cases[i].id} failed: ${(e as Error).message}`);
+    }
+  }
   return html;
 }
 

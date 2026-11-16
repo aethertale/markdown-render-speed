@@ -21,10 +21,11 @@ marked's `_backpedal` URL trimming).
 
 ## Speed
 
-On the practice set (720 cases) the parser runs in ~480 ms on this machine,
-against ~1,309 ms for marked itself — about 2.7× faster — while producing
-byte-identical HTML. It is stateless per call: no caching across cases, no
-memo, nothing written to disk.
+On the practice set the parser produces byte-identical HTML for all 720
+cases (680 CommonMark/GFM spec cases plus 40 long README documents), and
+runs in ~475–575 ms on this machine against ~675–770 ms for marked itself on the
+same cases — about 1.3–1.4× faster. It is stateless per call: no caching across
+cases, no memo, nothing written to disk.
 
 ## Usage
 

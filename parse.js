@@ -354,8 +354,10 @@ function scanLabel(text, openIdx) {
       const run = k - j;
       // a code span inside a label closes on the NEXT backtick run of
       // any length (marked's label pattern has no equal-run backref);
-      // with no closing run the label fails, except a run of >= 2
-      // backticks immediately before ']' (the ``+(?=]) alternative)
+      // a run of >= 2 backticks immediately before ']' is literal
+      // (the ``+(?=]) alternative) and wins over a later run elsewhere;
+      // a single backtick before ']' opens a code span instead (cm-525)
+      if (run >= 2 && k < n && text[k] === ']') { j = k; continue; }
       let m = k;
       let found = -1;
       while (m < n) {
@@ -879,38 +881,305 @@ function scanExtUrl(text, i) {
 // marked's inline _backpedal regex, used to trim a GFM autolink URL.
 const BACKPEDAL_RE = /(?:[^?!.,:;*_'\"~()&]+|\([^)]*\)|&(?![a-zA-Z0-9]+;$)|[?!.,:;*_'\"~)]+(?!$))+/;
 
-// The CommonMark "rule of 3": an opener and a closer whose lengths sum to
-// a multiple of 3 cannot match when either of them can both open and close,
-// unless both lengths are themselves multiples of 3.
-function emphasisOdd(opener, closer) {
-  const eitherBoth = (opener.canOpen && opener.canClose) || (closer.canOpen && closer.canClose);
-  if (!eitherBoth) return false;
-  if ((opener.n + closer.n) % 3 !== 0) return false;
-  return opener.n % 3 !== 0 || closer.n % 3 !== 0;
+// ---------------------------------------------------------------------------
+// Emphasis / strikethrough: a port of marked's greedy left-to-right scan.
+// The CommonMark delimiter stack gets the nesting wrong when an inner
+// opener run must also be closed by the outer closer (e.g. `*a **b**c*`
+// stays literal in marked, but a closer-first stack wraps an em), so each
+// opener is scanned forward over the delimiter runs that follow it,
+// tracking how many opener delims are still unclosed (m) and how many
+// were skipped by the rule of 3 (f). Delimiters are handled in text order
+// (an em and a del that overlap are decided by whichever starts first),
+// and the scan recurses into a span's children the way marked re-tokenizes
+// the span's inner text.
+// ---------------------------------------------------------------------------
+
+// GFM punctuation for flanking: Unicode P/S except '~' (marked's GFM
+// punct set excludes the strikethrough delimiter).
+function isScanPunct(c) {
+  return c !== '~' && isPunctCh(c);
 }
 
-// Walk back from a closer delimiter to find a matching opener (same
-// character, can open). Returns the opener node or null. For '~' the
-// counts must be equal; for '*'/'_' the rule of 3 applies.
-function findEmphasisOpener(closer, dummy) {
-  let opener = closer.prev;
-  while (opener && opener !== dummy) {
-    if (opener.t === 1 && opener.ch === closer.ch && opener.canOpen) {
-      if (closer.ch === '~') {
-        if (opener.n === closer.n) return opener;
-      } else if (!emphasisOdd(opener, closer)) {
-        return opener;
+// Left/right flanking of a delimiter run from its neighbouring characters
+// (GFM classes).
+function scanFlank(before, after) {
+  const bw = before === undefined || isSpaceCh(before);
+  const bp = before !== undefined && isScanPunct(before);
+  const aw = after === undefined || isSpaceCh(after);
+  const ap = after !== undefined && isScanPunct(after);
+  return {
+    left: !aw && (!ap || bw || bp),
+    right: !bw && (!bp || aw || ap),
+    bw, bp, aw, ap,
+  };
+}
+
+// Classify a candidate delimiter run for the scan: 'open' (open-only),
+// 'close' (close-only), 'both', or null (invisible: neither flanking, or
+// for '_' an intraword run, which marked's GFM scan cannot see at all).
+// The punctuation class differs by character: '*' uses marked's GFM
+// punct (excluding '~'), while '_' and '~' use the default punct set
+// (including '~').
+function scanClassify(node) {
+  const punct = node.ch === '*' ? isScanPunct : isPunctCh;
+  const before = node.before, after = node.after;
+  const bw = before === undefined || isSpaceCh(before);
+  const bp = before !== undefined && punct(before);
+  const aw = after === undefined || isSpaceCh(after);
+  const ap = after !== undefined && punct(after);
+  const left = !aw && (!ap || bw || bp);
+  const right = !bw && (!bp || aw || ap);
+  if (!left && !right) return null;
+  if (left && !right) return 'open';
+  if (!left && right) return 'close';
+  // both flanking; for '_' a run with word characters on both sides is
+  // intraword and invisible to the scan
+  if (node.ch === '_' && !bw && !bp && !aw && !ap) return null;
+  return 'both';
+}
+
+// --- Masking: ranges of the inline text that marked's emphasis scan
+// cannot see (its #n step masks code spans, link-shaped spans, HTML tags
+// and known reference links before scanning). Delimiter runs inside a
+// masked span are invisible to the scan. ---
+
+// End index of a code span starting at a backtick run at text[i], under
+// the masking rule (the closing run must be the first backtick run after
+// the opening run, of the same length, with non-empty content), or -1.
+function maskCodeSpanEnd(text, i) {
+  const n = text.length;
+  let k = i;
+  while (k < n && text[k] === '`') k++;
+  const run = k - i;
+  let m = k;
+  while (m < n) {
+    if (text[m] === '`') {
+      let e = m;
+      while (e < n && text[e] === '`') e++;
+      // a run of the wrong length is content, not the closer
+      if (e - m === run) {
+        if (m === k) return -1;
+        return e;
       }
-    }
-    opener = opener.prev;
+      m = e;
+    } else m++;
   }
-  return null;
+  return -1;
 }
 
-// Wrap the nodes between opener and closer in an em/strong/del node,
-// consuming `use` delimiters from each side, and splice it into the list.
-function wrapEmphasis(opener, closer, use) {
-  const emNode = { t: 7, strong: use === 2, del: closer.ch === '~', children: [], prev: null, next: null };
+// Scan a link label for masking, from text[i] === '['. Returns the index
+// just past the closing ']', or -1. Label characters are anything except
+// '[', ']' and backtick, or a code span (equal backtick runs).
+function maskLabelEnd(text, i) {
+  const n = text.length;
+  let j = i + 1;
+  while (j < n) {
+    const c = text[j];
+    if (c === '\\' && j + 1 < n && ASCII_PUNCT.indexOf(text[j + 1]) >= 0) { j += 2; continue; }
+    if (c === '`') {
+      const e = maskCodeSpanEnd(text, j);
+      if (e < 0) return -1;
+      j = e;
+      continue;
+    }
+    if (c === '[') return -1;
+    if (c === ']') return j + 1;
+    j++;
+  }
+  return -1;
+}
+
+// Scan a reference label for masking, from text[i] === '['. Returns the
+// index just past the closing ']', or -1. Backticks are ordinary here.
+function maskRefEnd(text, i) {
+  const n = text.length;
+  let j = i + 1;
+  while (j < n) {
+    const c = text[j];
+    if (c === '\\' && j + 1 < n) { j += 2; continue; }
+    if (c === '[') return -1;
+    if (c === ']') return j + 1;
+    j++;
+  }
+  return -1;
+}
+
+// Scan a parenthesized destination for masking, from text[i] === '('.
+// Returns the index just past the matching ')', or -1. Allows one level
+// of nested parens and escapes.
+function maskDestEnd(text, i) {
+  const n = text.length;
+  let depth = 1;
+  let j = i + 1;
+  while (j < n) {
+    const c = text[j];
+    if (c === '\\' && j + 1 < n) { j += 2; continue; }
+    if (c === '(') {
+      depth++;
+      if (depth > 2) return -1;
+      j++;
+      continue;
+    }
+    if (c === ')') {
+      depth--;
+      if (depth === 0) return j + 1;
+      j++;
+      continue;
+    }
+    j++;
+  }
+  return -1;
+}
+
+// Ranges [start, end) of the inline text that the emphasis scan cannot
+// see. Scanned left to right, non-overlapping, sorted.
+function maskedSpans(text, linkRefs) {
+  const n = text.length;
+  const spans = [];
+  let i = 0;
+  while (i < n) {
+    const c = text[i];
+    // an escaped character cannot open a code span or a link label
+    if (c === '\\' && i + 1 < n && ASCII_PUNCT.indexOf(text[i + 1]) >= 0) { i += 2; continue; }
+    if (c === '`') {
+      const cs = tryCodeSpan(text, i);
+      if (cs) { spans.push([i, cs.end]); i = cs.end; continue; }
+      let k = i;
+      while (k < n && text[k] === '`') k++;
+      i = k;
+      continue;
+    }
+    if (c === '[') {
+      const le = maskLabelEnd(text, i);
+      if (le > 0) {
+        if (text[le] === '(') {
+          const de = maskDestEnd(text, le);
+          if (de > 0) { spans.push([i, de]); i = de; continue; }
+        } else if (text[le] === '[') {
+          const re = maskRefEnd(text, le);
+          if (re > 0) {
+            const refText = text.slice(le + 1, re - 1);
+            const labText = text.slice(i + 1, le - 1);
+            const key = refText.length ? normLabel(refText) : normLabel(labText);
+            if (linkRefs && linkRefs.has(key)) { spans.push([i, re]); i = re; continue; }
+          }
+        } else {
+          const labText = text.slice(i + 1, le - 1);
+          if (linkRefs && linkRefs.has(normLabel(labText))) { spans.push([i, le]); i = le; continue; }
+        }
+      }
+      i++;
+      continue;
+    }
+    if (c === '<') {
+      if (i + 1 < n && text[i + 1] !== ' ') {
+        let j = i + 1;
+        while (j < n && text[j] !== '>' && text[j] !== '<') j++;
+        if (j < n && text[j] === '>') { spans.push([i, j + 1]); i = j + 1; continue; }
+      }
+      i++;
+      continue;
+    }
+    i++;
+  }
+  return spans;
+}
+
+// Is position pos inside one of the (sorted) masked spans?
+function isMaskedPos(spans, pos) {
+  let lo = 0;
+  let hi = spans.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const s = spans[mid];
+    if (pos < s[0]) hi = mid - 1;
+    else if (pos >= s[1]) lo = mid + 1;
+    else return true;
+  }
+  return false;
+}
+
+// The LDelim gate values for an opener node. d: the character after the
+// run is punctuation (GFM punct for '*'/'_', default punct for '~'). h:
+// the character before the extended run is a delimiter, whitespace or
+// punctuation (marked's `punctuation` regex matches whitespace too, and
+// includes '~'). The gate passes unless the character after the run is
+// punctuation while the character before it is a word character.
+function ldelimGate(node) {
+  const d = node.after !== undefined && (node.ch === '~' ? isPunctCh(node.after) : isScanPunct(node.after));
+  const p = node.p;
+  const h = p !== undefined && (p === '*' || p === '_' || isSpaceCh(p) || isPunctCh(p));
+  const nGate = node.o ? p : node.before;
+  const u = node.o ? h : (nGate !== undefined && (isSpaceCh(nGate) || isPunctCh(nGate)));
+  return { d, h, pass: !d || nGate === undefined || u };
+}
+function skipRunPos(text, start, ch) {
+  const other = ch === '*' ? '_' : '*';
+  let i = start;
+  while (i < text.length && text[i] !== ch && text[i] !== other) i++;
+  if (i >= text.length || text[i] !== other) return -1;
+  let j = i;
+  while (j < text.length && text[j] === other) j++;
+  if (j - i < 2) return -1;
+  let k = j;
+  while (k < text.length && text[k] !== ch && text[k] !== other) k++;
+  if (k >= text.length || text[k] !== ch) return -1;
+  let m = k;
+  while (m < text.length && text[m] === ch) m++;
+  let p = m;
+  while (p < text.length && text[p] !== ch && text[p] !== other) p++;
+  if (p >= text.length || text[p] !== other) return -1;
+  let q = p;
+  while (q < text.length && text[q] === other) q++;
+  if (q - p < 2) return -1;
+  return k;
+}
+
+// First source character of a node (for flanking of delimiter runs placed
+// inside a span).
+function firstSrcChar(nd) {
+  if (nd.t === 0) return nd.s.length ? nd.s[0] : undefined;
+  if (nd.t === 1) return nd.ch;
+  if (nd.t === 4) return '`';
+  if (nd.t === 2 || nd.t === 3) return '!';
+  if (nd.t === 5) return '<';
+  if (nd.t === 6) return '\n';
+  if (nd.t === 8) return nd.text.length ? nd.text[0] : undefined;
+  if (nd.t === 7) return nd.children.length ? firstSrcChar(nd.children[0]) : undefined;
+  return undefined;
+}
+function lastSrcChar(nd) {
+  if (nd.t === 0) return nd.s.length ? nd.s[nd.s.length - 1] : undefined;
+  if (nd.t === 1) return nd.ch;
+  if (nd.t === 4) return '`';
+  if (nd.t === 2 || nd.t === 3) return ']';
+  if (nd.t === 5) return '>';
+  if (nd.t === 6) return '\n';
+  if (nd.t === 8) return nd.text.length ? nd.text[nd.text.length - 1] : undefined;
+  if (nd.t === 7) return nd.children.length ? lastSrcChar(nd.children[nd.children.length - 1]) : undefined;
+  return undefined;
+}
+
+// Wrap the nodes between opener and closer in an em/strong/del node.
+// `k` is the opener length the scan used, `bPrime` the closer length it
+// used, `strip` the delims the span itself consumes from each end
+// (1 for em, 2 for strong, o for del). The opener's (k - strip) and the
+// closer's (bPrime - strip) leftover delims land INSIDE the span (marked
+// re-parses them as part of the span's inner text); the opener's
+// (opener.n - k) leading delims become literal text before the span, and
+// the closer's (closer.n - bPrime) trailing delims stay a delimiter node
+// after it. Returns the span node.
+function wrapScan(opener, closer, k, bPrime, strip, strong, del) {
+  const emNode = { t: 7, strong, del, children: [], prev: null, next: null };
+  // opener leftover inside the span (at its start): it stands at the
+  // start of the span's inner text, so it can only open, and only when
+  // the character after it is not whitespace
+  if (k - strip > 0) {
+    const first = opener.next;
+    const afterCh = first && first !== closer ? firstSrcChar(first) : undefined;
+    const nd = { t: 1, ch: opener.ch, n: k - strip, canOpen: afterCh !== undefined && !isSpaceCh(afterCh), canClose: false, before: undefined, after: afterCh, y: k - strip, p: undefined, o: false, masked: false, prev: null, next: null };
+    emNode.children.push(nd);
+  }
   let x = opener.next;
   while (x !== closer) {
     const nx = x.next;
@@ -918,40 +1187,205 @@ function wrapEmphasis(opener, closer, use) {
     x.prev = null; x.next = null;
     x = nx;
   }
-  opener.n -= use;
-  closer.n -= use;
+  // closer leftover inside the span (at its end): it stands at the end
+  // of the span's inner text, so it can only close, and only when the
+  // character before it is not whitespace
+  if (bPrime - strip > 0) {
+    const last = emNode.children.length ? emNode.children[emNode.children.length - 1] : null;
+    const beforeCh = last ? lastSrcChar(last) : undefined;
+    const nd = { t: 1, ch: closer.ch, n: bPrime - strip, canOpen: false, canClose: beforeCh !== undefined && !isSpaceCh(beforeCh), before: beforeCh, after: undefined, y: bPrime - strip, p: undefined, o: false, masked: false, prev: null, next: null };
+    emNode.children.push(nd);
+  }
+  // link the children into a doubly-linked list for the recursion
+  for (let ci = 0; ci < emNode.children.length; ci++) {
+    emNode.children[ci].prev = ci > 0 ? emNode.children[ci - 1] : null;
+    emNode.children[ci].next = ci < emNode.children.length - 1 ? emNode.children[ci + 1] : null;
+  }
   const openerPrev = opener.prev;
   const closerNext = closer.next;
-  if (opener.n === 0) {
+  // opener's leading delims (opener.n - k) become literal text
+  if (opener.n - k > 0) {
+    const lit = { t: 0, s: opener.ch.repeat(opener.n - k), prev: openerPrev, next: emNode };
+    if (openerPrev) openerPrev.next = lit;
+    emNode.prev = lit;
+  } else if (openerPrev) {
     openerPrev.next = emNode;
     emNode.prev = openerPrev;
   } else {
-    opener.next = emNode;
-    emNode.prev = opener;
+    emNode.prev = openerPrev;
   }
-  if (closer.n === 0) {
+  // closer's trailing delims (closer.n - bPrime) stay a delimiter node
+  if (closer.n - bPrime > 0) {
+    closer.n = closer.n - bPrime;
+    closer.prev = emNode;
+    emNode.next = closer;
+  } else {
     emNode.next = closerNext;
     if (closerNext) closerNext.prev = emNode;
-    return true; // closer consumed: stop matching this closer
   }
-  closer.prev = emNode;
-  emNode.next = closer;
-  return false;
+  return emNode;
 }
 
-// Process emphasis / strikethrough delimiter nodes in the linked list whose
-// dummy head is `dummy` (dummy.next is the first real node).
-function processEmphasis(dummy) {
+// Scan forward from an opener node for a matching closer. `k` is the
+// opener length to try, `text` the inline source (for the first-alternative
+// skip). Returns {closer, bPrime, minKB} or null.
+function scanEmphasis(opener, k, text) {
+  const ch = opener.ch;
+  const y = opener.y;
+  const p = opener.p;
+  const gate = ldelimGate(opener);
+  const d = gate.d;
+  const h = gate.h;
+  const o = opener.o || k < opener.n;
+  // R: a previous non-space character exists, and the character after the
+  // opener is punctuation, or (for '*') the previous character is not
+  // punctuation
+  const R = p !== undefined && !isSpaceCh(p) && (d || (ch === '*' && !h));
+  const skipPos = skipRunPos(text, opener.pos + opener.n, ch);
+  let m = k;
+  let f = 0;
+  let firstCand = true;
+  let x = opener.next;
+  while (x) {
+    if (x.t === 1 && x.ch === ch && !x.masked && x.n > 0) {
+      if (firstCand && skipPos >= 0 && x.pos === skipPos) { firstCand = false; x = x.next; continue; }
+      firstCand = false;
+      const cls = scanClassify(x);
+      if (cls === null) { x = x.next; continue; }
+      const b = x.n;
+      if (cls === 'open') { m += b; x = x.next; continue; }
+      if (cls === 'both' || R) {
+        if (o && cls === 'both') return null;
+        if (y % 3 !== 0 && (y + b) % 3 === 0) { f += b; x = x.next; continue; }
+      }
+      m -= b;
+      if (m > 0) { x = x.next; continue; }
+      const bPrime = Math.min(b, b + m + f);
+      return { closer: x, bPrime, minKB: Math.min(k, bPrime) };
+    }
+    x = x.next;
+  }
+  return null;
+}
+
+// Scan forward from a '~' opener for a matching closer. `o` is the opener
+// length (1 or 2). Returns {closer, bPrime} or null.
+function scanDel(opener, o) {
+  let p = o;
+  let x = opener.next;
+  while (x) {
+    if (x.t === 1 && x.ch === '~' && !x.masked && x.n > 0) {
+      const cls = scanClassify(x);
+      if (cls === null) { x = x.next; continue; }
+      if (cls === 'open') { p += x.n; x = x.next; continue; }
+      // every closer run subtracts from the balance, whatever its
+      // length (a single '~' closer inside a '~~' span still counts);
+      // only the run where the balance hits zero becomes the closer
+      p -= x.n;
+      if (p > 0) { x = x.next; continue; }
+      return { closer: x, bPrime: Math.min(x.n, x.n + p) };
+    }
+    x = x.next;
+  }
+  return null;
+}
+
+// Recompute a delimiter node's canOpen/canClose from its before/after
+// characters (the CommonMark flanking rules used at creation).
+function recomputeFlanking(node) {
+  const before = node.before, after = node.after;
+  const beforeWs = before === undefined || isSpaceCh(before);
+  const beforePunct = before !== undefined && isPunctCh(before);
+  const afterWs = after === undefined || isSpaceCh(after);
+  const afterPunct = after !== undefined && isPunctCh(after);
+  const leftFlanking = !afterWs && (!afterPunct || beforeWs || beforePunct);
+  const rightFlanking = !beforeWs && (!beforePunct || afterWs || afterPunct);
+  if (node.ch === '_') {
+    node.canOpen = leftFlanking && (!rightFlanking || beforePunct);
+    node.canClose = rightFlanking && (!leftFlanking || afterPunct);
+  } else {
+    node.canOpen = leftFlanking;
+    node.canClose = rightFlanking;
+  }
+}
+
+// A delimiter node at the very start or end of a span's inner text sees
+// the inner text's boundary (start/end) as its neighbour, not the span's
+// own delimiters or the text outside the span. Adjust those boundary
+// nodes before recursing into the span, so their flanking matches a
+// fresh tokenization of the inner text.
+function adjustSpanBoundary(children) {
+  if (!children.length) return;
+  const first = children[0];
+  if (first.t === 1) {
+    first.before = undefined;
+    first.p = undefined;
+    first.o = false;
+    first.y = first.n;
+    recomputeFlanking(first);
+  }
+  const last = children[children.length - 1];
+  if (last.t === 1) {
+    last.after = undefined;
+    recomputeFlanking(last);
+  }
+}
+
+// Recurse into a span node's children, then refresh its children array
+// (a wrap inside the recursion replaces nodes, so the array goes stale).
+function processSpanChildren(span, text) {
+  if (!span.children.length) return;
+  adjustSpanBoundary(span.children);
+  const childDummy = { t: -1, prev: null, next: span.children[0] };
+  span.children[0].prev = childDummy;
+  processEmphasis(childDummy, text);
+  const arr = [];
+  let x = childDummy.next;
+  while (x) { arr.push(x); x = x.next; }
+  span.children = arr;
+}
+
+// Process emphasis / strikethrough in the node list whose dummy head is
+// `dummy`, following marked's left-to-right token order: at each delimiter
+// run, try to form its span; on failure the run stays literal (and stays
+// available as a candidate for later openers). `text` is the inline source.
+function processEmphasis(dummy, text) {
   let cur = dummy.next;
   while (cur) {
     const next = cur.next;
-    if (cur.t === 1 && cur.canClose) {
-      let closer = cur;
-      while (closer.n > 0) {
-        const opener = findEmphasisOpener(closer, dummy);
-        if (!opener) break;
-        const use = (opener.n >= 2 && closer.n >= 2) ? 2 : 1;
-        if (wrapEmphasis(opener, closer, use)) break;
+    if (cur.t === 1 && !cur.masked && cur.n > 0) {
+      if ((cur.ch === '*' || cur.ch === '_') && cur.canOpen) {
+        // LDelim gate: enter the scan unless the character after the
+        // opener is punctuation while the character before it is a word
+        // character
+        if (ldelimGate(cur).pass) {
+          let hit = null;
+          let kk = 0;
+          for (let k = cur.n; k >= 1; k--) {
+            const r = scanEmphasis(cur, k, text);
+            if (r) { hit = r; kk = k; break; }
+          }
+          if (hit) {
+            const strip = hit.minKB % 2 === 1 ? 1 : 2;
+            const span = wrapScan(cur, hit.closer, kk, hit.bPrime, strip, hit.minKB % 2 === 0, false);
+            // recurse into the span's children (marked re-tokenizes them)
+            processSpanChildren(span, text);
+            // continue after the span (its closer leftover, if any, is next)
+            cur = span.next;
+            continue;
+          }
+        }
+      } else if (cur.ch === '~' && cur.canOpen) {
+        if (ldelimGate(cur).pass) {
+          const o = Math.min(cur.n, 2);
+          const hit = scanDel(cur, o);
+          if (hit) {
+            const span = wrapScan(cur, hit.closer, o, hit.bPrime, o, false, true);
+            processSpanChildren(span, text);
+            cur = span.next;
+            continue;
+          }
+        }
       }
     }
     cur = next;
@@ -995,6 +1429,9 @@ function renderNode(nd) {
 // Parse inline content to a node list. linkRefs is a Map of normalised label -> {dest, title}.
 function inlineToNodes(text, linkRefs, inLink) {
   const n = text.length;
+  // ranges of this inline text that the emphasis scan cannot see
+  // (code spans, link-shaped spans, HTML tags, known reference links)
+  const maskSpans = maskedSpans(text, linkRefs);
   // a label's tokenization saves/restores the document-level inLink
   const savedDocInLink = inLink ? docInLink : null;
   const dummy = { t: -1, prev: null, next: null };
@@ -1097,7 +1534,13 @@ function inlineToNodes(text, linkRefs, inLink) {
         canClose = rightFlanking;
       }
       if (!canOpen && !canClose) { pushText(text.slice(i, k)); i = k; continue; }
-      pushNode({ t: 1, ch: c, n: run, canOpen, canClose, prev: null, next: null });
+      // y is the full run length including any same-character run
+      // immediately before it (e.g. an escaped `\*` before a `*` run);
+      // p is the character before that extended run, o whether the run
+      // is preceded by the same delimiter character at all
+      let ext = i;
+      while (ext > 0 && text[ext - 1] === c) ext--;
+      pushNode({ t: 1, ch: c, n: run, canOpen, canClose, pos: i, before, after, y: k - ext, p: ext > 0 ? text[ext - 1] : undefined, o: ext < i, masked: isMaskedPos(maskSpans, i), prev: null, next: null });
       i = k;
       continue;
     }
@@ -1274,7 +1717,7 @@ function inlineToNodes(text, linkRefs, inLink) {
     i++;
   }
   flush();
-  processEmphasis(dummy);
+  processEmphasis(dummy, text);
   // a label's tokenization restores the document-level inLink
   if (savedDocInLink !== null) docInLink = savedDocInLink;
   // collect the list into an array for rendering
@@ -1371,12 +1814,34 @@ function restCursor(cursor) {
   if (cursor.pend > 0) s += ' '.repeat(cursor.pend);
   return s + cursor.s.slice(cursor.i);
 }
+// Dedent a fenced-code content line by the fence's indent, the way
+// marked's Dt does: remove min(leadingWsChars, fenceIndentChars)
+// CHARACTERS from the leading whitespace (a tab is one character and
+// is removed whole, not expanded to columns first).
+function dedentFenceLine(cursor, fi) {
+  if (fi <= 0) return;
+  let chars = 0;
+  // a partially consumed tab is one character; removing it drops its
+  // remaining spaces too
+  if (cursor.pend > 0) { cursor.pend = 0; chars++; }
+  while (chars < fi && cursor.i < cursor.s.length && (cursor.s[cursor.i] === ' ' || cursor.s[cursor.i] === '\t')) {
+    if (cursor.s[cursor.i] === '\t') cursor.col += 4 - (cursor.col & 3);
+    else cursor.col++;
+    cursor.i++;
+    chars++;
+  }
+}
+
 // A fenced-code content line with leading tabs expanded to spaces (a tab
-// advances to the next multiple of 4 columns from the cursor's column).
-// A partially consumed tab (pend) renders as spaces first.
-function fencedCodeLine(cursor) {
+// advances to the next multiple of 4 columns from the starting column).
+// A partially consumed tab (pend) renders as spaces first. `startCol`
+// overrides the cursor's column as the tab-expansion origin: marked
+// re-lexes blockquote content, so a tab inside a fence whose innermost
+// container is a blockquote expands from the column the tab would have
+// in the re-lexed line (the outer containers' columns forgotten).
+function fencedCodeLine(cursor, startCol) {
   let out = ' '.repeat(cursor.pend);
-  let col = cursor.col + cursor.pend;
+  let col = (startCol !== undefined ? startCol : cursor.col) + cursor.pend;
   const s = cursor.s.slice(cursor.i);
   let i = 0;
   while (i < s.length && (s[i] === ' ' || s[i] === '\t')) {
@@ -1852,7 +2317,12 @@ function parseBlocks(src) {
     } else if (c === '`' || c === '~') {
       let idx = cursor.i;
       while (idx < cursor.s.length && cursor.s[idx] === c) idx++;
-      if (idx - cursor.i >= 3) r = true;
+      if (idx - cursor.i >= 3) {
+        // a backtick fence whose info string contains a backtick is not
+        // a fence at all, so it cannot interrupt a paragraph
+        if (c === '`' && cursor.s.slice(idx).indexOf('`') >= 0) r = false;
+        else r = true;
+      }
     } else if (c === '<') {
       const t = htmlBlockType(cursor);
       if (t >= 1 && t <= 6) r = true;
@@ -1892,7 +2362,10 @@ function parseBlocks(src) {
     } else if (c === '`' || c === '~') {
       let idx = cursor.i;
       while (idx < cursor.s.length && cursor.s[idx] === c) idx++;
-      if (idx - cursor.i >= 3) r = true;
+      if (idx - cursor.i >= 3) {
+        if (c === '`' && cursor.s.slice(idx).indexOf('`') >= 0) r = false;
+        else r = true;
+      }
     } else if (c === '<') {
       const t = htmlBlockType(cursor);
       if (t >= 1 && t <= 6) r = true;
@@ -1990,23 +2463,45 @@ function parseBlocks(src) {
 
     // ---- phase 1: match open containers
     let depth = 0;
+    // columns consumed by container levels outside the innermost
+    // column-consuming level, and whether that level is a blockquote
+    let outerCols = 0;
+    let innermostQuote = false;
     for (let si = 1; si < stack.length; si++) {
       const node = stack[si];
       if (node.t === 'quote') {
         const saved = saveCursor(cursor);
+        const cb = cursor.col;
         const indent = skipCursorSpaces(cursor);
         if (indent > 3 || peekCursor(cursor) !== '>') { restoreCursor(cursor, saved); break; }
         advanceCursor(cursor);
-        if (peekCursor(cursor) === ' ' || peekCursor(cursor) === '\t') advanceCursor(cursor);
+        if (peekCursor(cursor) === ' ' || peekCursor(cursor) === '\t') {
+          if (peekCursor(cursor) === '\t') {
+            // marked re-lexes blockquote content, so the whitespace
+            // after '>' expands from the marker's length in the
+            // re-lexed line (leading spaces + '>'), not from the
+            // original column
+            const reCol = indent + 1;
+            const w = 4 - (reCol & 3);
+            cursor.pend = w - 1;
+            cursor.i++;
+            cursor.col++;
+          } else advanceCursor(cursor);
+        }
         depth = si;
+        outerCols = cb;
+        innermostQuote = true;
       } else if (node.t === 'item') {
         if (isBlankCursor(cursor)) { depth = si; continue; }
         // an empty item followed by a blank line takes no further content
         if (node.children.length === 0 && node.lastLineBlank) break;
+        const cb = cursor.col;
         const indent = indentCursor(cursor);
         if (indent >= node.contentIndent) {
           advanceCursorN(cursor, node.contentIndent);
           depth = si;
+          outerCols = cb;
+          innermostQuote = false;
         } else break;
       } else if (node.t === 'list') {
         depth = si;
@@ -2104,7 +2599,12 @@ function parseBlocks(src) {
         else if (tip.t === 'table') { closeBlock(stack.pop()); }
         else if (tip.t === 'code') {
           if (tip.fenced) {
-            // a blank line in fenced code keeps its whitespace as-is
+            // a blank line in fenced code is dedented like any other
+            // content line (backtick fences only; tilde fences keep it)
+            if (tip.fenceChar === '`') {
+              const fiB = tip.fenceIndentChars !== undefined ? tip.fenceIndentChars : (tip.fenceIndent || 0);
+              dedentFenceLine(cursor, fiB);
+            }
             tip.lines.push(restCursor(cursor));
           } else {
             // a blank line in indented code loses 4 columns of indent
@@ -2119,7 +2619,15 @@ function parseBlocks(src) {
       // a blank line that is only container markers (e.g. `> `) is blank
       // only for the deepest matched container, not for its ancestors
       if (/^[ \t]*$/.test(line)) markBlank();
-      else stack[depth].lastLineBlank = true;
+      else {
+        stack[depth].lastLineBlank = true;
+        // a marker-only blank line directly inside a list item separates
+        // that item from the next one, so the item's list is loose too
+        // (a blank line deeper inside the item, e.g. inside a nested
+        // blockquote, does not: cm-320 stays tight)
+        const at = stack[depth];
+        if (at.t === 'item' && at.parent && at.parent.t === 'list') at.parent.lastLineBlank = true;
+      }
       continue;
     }
 
@@ -2147,13 +2655,24 @@ function parseBlocks(src) {
         restoreCursor(cursor, saved);
       }
       if (closed) { markNonBlank(); continue; }
-      // dedent the content line by the fence's own indent
-      const stripF = Math.min(tip.fenceIndent || 0, indent);
-      if (stripF > 0) advanceCursorN(cursor, stripF);
+      // Dedent the content line by the fence's own indent. Marked's Dt
+      // removes min(leadingWsChars, fenceIndentChars) CHARACTERS from
+      // the line's leading whitespace (a tab is one character and is
+      // removed whole, not expanded to columns first); a tilde fence
+      // keeps its content lines verbatim (indentCodeCompensation only
+      // matches ```).
+      if (tip.fenceChar === '`') {
+        const fi = tip.fenceIndentChars !== undefined ? tip.fenceIndentChars : (tip.fenceIndent || 0);
+        dedentFenceLine(cursor, fi);
+      }
       // a leading tab expands to spaces only when the block sits inside
       // a container (list item / blockquote); at the top level a tab
-      // stays a literal tab
-      tip.lines.push(tip.parent && tip.parent.t !== 'doc' ? fencedCodeLine(cursor) : restCursor(cursor));
+      // stays a literal tab. When the innermost container is a
+      // blockquote inside another container, marked re-lexes the
+      // blockquote content, so the tab expands from the column with the
+      // outer containers' columns forgotten.
+      const effCol = innermostQuote && outerCols > 0 ? cursor.col - outerCols : cursor.col;
+      tip.lines.push(tip.parent && tip.parent.t !== 'doc' ? fencedCodeLine(cursor, effCol) : restCursor(cursor));
       markNonBlank();
       continue;
     }
@@ -2228,7 +2747,11 @@ function parseBlocks(src) {
           continue;
         }
       } else {
-        const rest = restCursor(cursor);
+        // a leading tab in a paragraph line expands to spaces when the
+        // paragraph sits inside a container (marked re-lexes the
+        // container content); at the top level it stays a literal tab
+        const paraEffCol = innermostQuote && outerCols > 0 ? cursor.col - outerCols : cursor.col;
+        const rest = tip.parent && tip.parent.t !== 'doc' ? fencedCodeLine(cursor, paraEffCol) : restCursor(cursor);
         // a delimiter row is indented at most 3 columns
         const aligns = indentCursor(cursor) <= 3 ? parseDelimiterRow(rest) : null;
         if (aligns) {
@@ -2389,7 +2912,11 @@ function parseBlocks(src) {
               info = info.replace(/^[ \t]+/, '').replace(/[ \t]+$/, '');
               // content lines are dedented by the fence's own indent
               const fenceIndent = cursor.col - iterStart.col;
-              const code = { t: 'code', fenced: true, fenceChar: c, fenceLen: run, info: info === '' ? null : info, fenceIndent, lines: [], parent: null };
+              // marked's Dt removes min(leadingWsChars, fenceIndentChars)
+              // CHARACTERS (a tab is one character); store the indent in
+              // characters too (cursor.i counts characters, not columns)
+              const fenceIndentChars = cursor.i - iterStart.i;
+              const code = { t: 'code', fenced: true, fenceChar: c, fenceLen: run, info: info === '' ? null : info, fenceIndent, fenceIndentChars, lines: [], parent: null };
               addChild(container, code);
               stack.push(code);
               markNonBlank();
@@ -2471,7 +2998,11 @@ function parseBlocks(src) {
       }
       // paragraph
       restoreCursor(cursor, iterStart);
-      const para = { t: 'para', lines: [restCursor(cursor)], parent: null, lastLineBlank: false };
+      // a leading tab in a paragraph inside a container expands like a
+      // continuation line (marked re-lexes the container content); at
+      // the top level it stays a literal tab
+      const paraCreateEffCol = innermostQuote && outerCols > 0 ? cursor.col - outerCols : cursor.col;
+      const para = { t: 'para', lines: [container && container.t !== 'doc' ? fencedCodeLine(cursor, paraCreateEffCol) : restCursor(cursor)], parent: null, lastLineBlank: false };
       addChild(container, para);
       stack.push(para);
       markNonBlank();
