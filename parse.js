@@ -2173,8 +2173,10 @@ function parseBlocks(src) {
       tip.lines.push(lineText);
       // the block keeps a trailing newline iff it is not immediately
       // followed by a blank line (or it is the last line and the input
-      // ends with a newline)
-      tip.keepNL = isLastLine ? endsWithNL : !/^[ \t]*$/.test(lines[li + 1]);
+      // ends with a newline); for types 1-5 a whitespace-only line is
+      // not a blank line for this purpose (only a truly empty line is),
+      // while types 6-7 drop the newline after any blank line
+      tip.keepNL = isLastLine ? endsWithNL : (tip.htmlType >= 1 && tip.htmlType <= 5 ? lines[li + 1] !== '' : !/^[ \t]*$/.test(lines[li + 1]));
       if (tip.htmlType >= 1 && tip.htmlType <= 5 && htmlBlockEnds(tip.htmlType, lineText)) {
         closeBlock(stack.pop());
       }
@@ -2401,7 +2403,7 @@ function parseBlocks(src) {
           if (t >= 1 && t <= 7) {
             restoreCursor(cursor, iterStart);
             const firstLine = restCursor(cursor);
-            const html = { t: 'html', htmlType: t, lines: [firstLine], keepNL: isLastLine ? endsWithNL : !/^[ \t]*$/.test(lines[li + 1]), parent: null };
+            const html = { t: 'html', htmlType: t, lines: [firstLine], keepNL: isLastLine ? endsWithNL : (t >= 1 && t <= 5 ? lines[li + 1] !== '' : !/^[ \t]*$/.test(lines[li + 1])), parent: null };
             addChild(container, html);
             // types 1-5 can already end on their first line
             if (t >= 1 && t <= 5 && htmlBlockEnds(t, firstLine)) {
